@@ -233,6 +233,9 @@
     border:2px solid var(--neon);padding:10px 16px;opacity:0;pointer-events:none;transition:.18s;text-align:center;line-height:1.6;}
   #toast.on{opacity:1;transform:translate(-50%,-50%) scale(1);}
 
+@keyframes voicePulse{0%,100%{box-shadow:0 0 0 0 rgba(255,210,70,.0)}50%{box-shadow:0 0 0 5px rgba(255,210,70,.55)}}
+.hudbtn.needTap,.tbtn.needTap{animation:voicePulse .9s infinite;border-color:#ffd246;color:#ffd246}
+
 #rotateGate{display:none;position:fixed;inset:0;z-index:100;background:
   radial-gradient(circle at 50% 30%, rgba(12,44,66,.98), rgba(2,5,10,.995) 72%),
   repeating-linear-gradient(0deg, rgba(0,229,255,.04) 0 1px, transparent 1px 4px);
@@ -2637,12 +2640,45 @@ function makeQuiz(lvMax, n){
 /* =============================================================
    音频系统：8-bit BGM + 合成音效 + 英文语音
    ============================================================= */
+const SILENT_WAV = 'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+
 const AudioSys = {
   ctx:null, master:null, musicBus:null, sfxBus:null, ready:false,
   timer:null, step:0, track:null, boss:false, paused:false,
   noiseBuf:null, voices:[], duckUntil:0,
-  voiceStarted:false, voicePrimed:false, voiceHintShown:false,
+  voiceStarted:false, voicePrimed:false, voiceHintShown:false, ttsFailed:false,
   lastGesture:0, _speakSeq:0, _speakTimer:null, _voiceWatch:null,
+  _audioPrimed:false, _wordAudio:null,
+
+  /* 微信/安卓没有 speechSynthesis 时，用有道词典音频兜底；触摸时静音预热一次，避开自动播放限制。 */
+  primeAudio(){
+    if (this._audioPrimed) return;
+    this._audioPrimed = true;
+    try{
+      /* 复用同一个 Audio 元素：这次手势播放静音后，后续自动播放才不会被 iOS/微信拦截。 */
+      if (!this._wordAudio) this._wordAudio = new Audio();
+      const a = this._wordAudio;
+      a.src = SILENT_WAV;
+      a.volume = 0.01;
+      const p = a.play();
+      if (p && p.catch) p.catch(()=>{});
+      setTimeout(()=>{ try{a.pause();}catch(e){} }, 60);
+    }catch(e){}
+  },
+
+  playOnlineWord(text, rate){
+    try{
+      if (!this._wordAudio) this._wordAudio = new Audio();
+      const a = this._wordAudio;
+      a.pause();
+      a.src = 'https://dict.youdao.com/dictvoice?audio=' + encodeURIComponent(text) + '&type=2';
+      a.playbackRate = clamp((rate||0.82)/0.82, 0.7, 1.2);
+      const p = a.play();
+      if (p && p.catch) p.catch(()=>{});
+      this.duck(1.6);
+      return true;
+    }catch(e){ return false; }
+  },
 
   initVoices(){
     if (!('speechSynthesis' in window)) return;
@@ -2662,8 +2698,9 @@ const AudioSys = {
 
   /* iOS Safari 必须由一次用户手势“点亮”语音合成；只做一次，失败后下一次触摸再试。 */
   primeVoice(){
-    if (!('speechSynthesis' in window)) return;
     this.markGesture();
+    this.primeAudio();
+    if (!('speechSynthesis' in window)) return;
     this.initVoices();
     if (this.voiceStarted || this.voicePrimed) return;
     this.voicePrimed = true;
@@ -2795,8 +2832,12 @@ const AudioSys = {
      iOS：cancel 后立刻 speak 会把新语音吞掉；自动朗读延迟 50ms，
      手势内朗读则立即执行并保留用户激活态。 */
   speak(text, rate){
-    if (!('speechSynthesis' in window)) return false;
     if (!settings.voice || !text) return false;
+    /* 微信安卓 X5 等环境没有 Web Speech API：直接走在线音频兜底。 */
+    if (!('speechSynthesis' in window) || this.ttsFailed){
+      this.primeAudio();
+      return this.playOnlineWord(text, rate);
+    }
     this.initVoices();
     const seq = ++this._speakSeq;
     const immediate = (Date.now() - (this.lastGesture || 0)) < 900;
@@ -2821,7 +2862,7 @@ const AudioSys = {
         speechSynthesis.resume();
         speechSynthesis.speak(u);
         this.duck(1.6);
-        this.watchVoice(seq);
+        this.watchVoice(seq, text, rate);
       }catch(e){}
     };
     clearTimeout(this._speakTimer);
@@ -2830,13 +2871,20 @@ const AudioSys = {
     return true;
   },
 
-  watchVoice(seq){
+  watchVoice(seq, text, rate){
     if (this.voiceStarted || this.voiceHintShown) return;
     clearTimeout(this._voiceWatch);
     this._voiceWatch = setTimeout(()=>{
       if (seq !== this._speakSeq || this.voiceStarted) return;
       this.voiceHintShown = true;
-      if (typeof toast === 'function') toast('听不到单词？点右下角 🔊 重听');
+      this.ttsFailed = true;
+      this.playOnlineWord(text, rate);
+      try{
+        const rb=document.getElementById('btnRepeat'), tr=document.getElementById('tRepeat');
+        if (rb) rb.classList.add('needTap');
+        if (tr) tr.classList.add('needTap');
+      }catch(e){}
+      if (typeof toast === 'function') toast('已切换在线发音；若无声点 🔊 重听');
     }, 1000);
   },
 
@@ -5804,6 +5852,8 @@ window.addEventListener('pointerdown', unlockAudioAndVoice, { passive:true, capt
 window.addEventListener('touchstart', unlockAudioAndVoice, { passive:true, capture:true });
 window.addEventListener('click', unlockAudioAndVoice, { passive:true, capture:true });
 window.addEventListener('keydown', ()=> AudioSys.init(), { passive:true });
+/* 微信内部分安卓/iOS 需要等 JS Bridge 就绪后才能创建/恢复 AudioContext */
+document.addEventListener('WeixinJSBridgeReady', ()=>{ AudioSys.init(); if (isTouch) AudioSys.primeVoice(); }, false);
 document.addEventListener('visibilitychange', ()=>{
   if (document.hidden && G.state==='play') pauseGame();
   if (settings.voice && document.hidden) { try{ speechSynthesis.cancel(); }catch(e){} }
